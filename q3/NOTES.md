@@ -1,5 +1,8 @@
 # Q3 – Black-box (HackerRank Question 3)
 
+> **Superseded:** the confirmed model, results (best 1019.40/1020) and agent rules are in
+> `PROBLEM.md`. This file is the early exploration log.
+
 URL: https://www.hackerrank.com/test-v2/ae20p6kc193/questions/f4nrljkoig7
 Statement: "Query the black box to maximise payoff. Beware the noise."
 Task: implement `probe(t: float) -> list[float]` (Python 3). No feedback inside a run, so the
