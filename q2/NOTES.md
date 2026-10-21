@@ -42,6 +42,25 @@ Before this rewrite, 25 words gave N=30 in 15s.
 ## Status
 The current `solution.py` (pure-Python greedy) passed all the official test cases.
 
+## `solution_improved.py` (copy of `solution.py` with review fixes, not yet submitted)
+- **Greedy:**
+  - placements are cached per (N, length) and filled lazily;
+  - ties are broken toward tight packing (most filled neighbours);
+  - the code is split into the `_Packer` and `_Search` classes. No function exceeds complexity 10 (`.venv/bin/python -m mccabe --min 11`). The original has `_greedy` at 23 and `generate_grid` at 17, which is the judge's "complexity too high" warning.
+- **Deadlines:**
+  - the fallback layout starts from an area estimate instead of looping up from L;
+  - `verify` uses a set of line substrings;
+  - each greedy pass stops at the overall deadline.
+  - Before any valid grid exists (no separator letter), a pass may overrun, because invalid scores 0.
+- **Review fixes:**
+  - an empty required list returns a verified single letter;
+  - an obviously infeasible input (a required word contains a forbidden one) returns immediately instead of after the budget.
+- **`compare.py [seconds]`** runs both versions on the examples, edge cases and random cases, with a brute-force validity check.
+  - Results: same N on every case at 0.5s and 2s budgets.
+  - Improved is valid where the original isn't (empty required list).
+  - 1000 words: 7.5s against 10–16s for the original. Both overrun, because that case has no separator letter.
+  - The 2–3× greedy success-rate gain in the scratch benchmark did not translate into smaller N on these cases.
+
 ## numpy experiment (`experimental_numpy.py`, not used)
 - numpy is installed in `q2/.venv`, which is gitignored. Create it with `python3 -m venv .venv && .venv/bin/pip install numpy`; system pip is blocked by PEP 668.
 - I tried a min-conflicts local search at fixed N. It vectorizes scoring every placement of one word, but with a 2s budget it lost to the greedy:
