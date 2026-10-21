@@ -1,32 +1,45 @@
 # Q2: Word Search Generation, work notes
 
-Status: work in progress, paused at the user's request. Nothing here is committed yet.
-
 ## Problem (from the screenshots in this folder)
 - `generate_grid(required_words: list[str], forbidden_words: list[str]) -> list[str]`, returning N strings of length N, uppercase A–Z.
 - Every required word must appear in a straight line in one of 8 directions, forwards or backwards, on a torus (wrap-around). No forbidden word may appear anywhere in any direction.
 - Score per test: `t = (N - L) / (U - L)`, `score = 100 * 10^-t`, where L is the longest required word (hard lower bound) and U is the number of required words. An invalid grid scores 0.
-- One example is visible: required `ACE`, `FIG`, `OAK`, no forbidden words, a valid 3×3 grid. The 6×6 torus picture in the first screenshot uses 8 programming-language words.
-- Not known: time limit, input sizes, whether the screenshots were complete (the last one was cut off at "Constraints").
+- Examples: `ACE`/`FIG`/`OAK` → 3×3; the 6×6 torus picture with 8 programming-language words.
+- Not known: time limit, input sizes (last screenshot cut off at "Constraints"). Default budget is `total_seconds=3.0`; change it once the limit is known.
 
-## Implementation: `solution.py`
-- `_placements`: all consistent (cell → letter) placements of a word, 8 directions, wrapped.
-- `_try(n, ...)`: randomized DFS over required words (longest first). It prefers placements that overlap existing letters, and rejects a placement when it completes a forbidden word. Blank cells are then filled one at a time, preferring letters that appear in no forbidden word and never completing a forbidden word.
-- `verify`: independent checker, used before returning any grid.
-- `generate_grid`:
-  - phase 1: find any valid grid, starting at N = max(L, U) and growing N;
-  - phase 2: binary search N downward toward L within `total_seconds` (default 3s).
-- Safeguard: if no valid grid exists (e.g. a required word contains a forbidden one, forwards or backwards), it gives up at N > 3·start+10 and returns a dummy grid instead of looping forever.
+## Implementation: `solution.py` (pure Python, numpy isn't installed)
+1. Words contained in a longer required word (either direction) are dropped, since they come for free.
+2. **Guaranteed fallback** (`_row_layout`): a "safe" letter appears in no forbidden word.
+   - Required words are packed into every other row, each followed by a safe letter, and all other cells are safe letters.
+   - Every line other than inside one word then contains a safe letter, so this is valid whenever the input is feasible.
+3. **Greedy packer** (`_greedy`), with random restarts:
+   - Words are placed longest first, preferring the placement that adds the fewest new cells (max overlap).
+   - When no word overlaps, it takes the first free spot from a random offset.
+   - Each placement is rejected if it completes a forbidden word. The local regex check (`_hit_checker`) covers the 4 axes plus reversed words.
+   - Blanks are filled with safe letters. If no safe letter exists, it falls back to checking each letter.
+4. **Search**: binary search on N between L and the best grid found so far, then leftover time goes to best−1. Everything is bounded by the deadline.
+5. Every returned grid passes `verify`, which checks each torus line as a repeated cyclic string. `count_occurrences` is a slow brute-force checker kept for testing.
+6. Infeasible input (a required word contains a forbidden one): it returns a dummy grid after the budget, which scores 0 anyway.
 
-## Test results so far
-- 6×6 example (8 language words, forbidden `GO`, `ZIG`, `JS`, which I made up): N=6 (= L, the optimum), valid, 0.1s.
-- `ACE`/`FIG`/`OAK`: valid 3×3, instant.
-- Random stress case, 25 required words (3–9 letters) and 10 forbidden words: valid but N=30, which is above U=25 and so scores about 10 or less, and it took 15.5s, well over the 3s budget. The 40-word and 10-word stress cases had not finished when work was stopped.
+## Test results (3s budget, random words of 3–9 letters, random 3-letter forbidden words)
+| U | L | N | score |
+|---|---|---|---|
+| 8 | 9 | 9 | 100 |
+| 10 | 9 | 9 | 100 |
+| 25 | 9 | 11 | 75 |
+| 40 | 9 | 15 | 64 |
+| 100 | 9 | 23 | 70 |
 
-## Known problems and next steps
-1. Large inputs are weak. Phase 1 starts at N = U, but the DFS often fails there and walks N upward. Starting around N = L plus a small margin and shrinking down would probably do better, and a smarter initial placement (a greedy overlap-maximizing construction) would help.
-2. The 3s budget is only exceeded because phase 1 and `_placements` precomputation are not bounded by it. Phase 1 needs a deadline tied to `total_seconds`.
-3. `_placements` is recomputed for every `_try`. Cache it per (N, word).
-4. Need the real time limit and input sizes before tuning further.
-5. Early exit: stop as soon as N equals L, since that is already the maximum score.
-6. Mistakes found while testing, so they aren't repeated: my first made-up forbidden word `C` is a substring of `SCALA`, and a random required word contained a forbidden word reversed. Both made the instance infeasible, so check feasibility before blaming the solver.
+Both examples are optimal. Edge cases tested:
+- every letter forbidden somewhere;
+- infeasible input;
+- a single word whose wrap would form a forbidden word.
+
+The fast and slow checkers agreed on all of these.
+
+Before this rewrite, 25 words gave N=30 in 15s.
+
+## Possible next steps
+- Get the real time limit and input sizes. A longer budget will directly improve large-input N.
+- The greedy is slow for 100+ words, because overlap enumeration scales with N². Indexing placements could help.
+- Smarter packing: score placements by compactness as well as overlap, or try a local-search repair at N−1.

@@ -1,170 +1,224 @@
 """Word Search Generation: smallest square torus grid containing all required
 words and none of the forbidden words (8 directions, wrap-around)."""
+import math
 import random
+import re
 import string
 import time
 
 DIRS = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
+AXES = [(0, 1), (1, 0), (1, 1), (1, -1)]  # the other 4 directions are covered by reversed words
 
 
-def _walk(n, r, c, dr, dc, length):
-    return [((r + k * dr) % n, (c + k * dc) % n) for k in range(length)]
+def _lines(grid):
+    """Every torus line (row, column, both diagonals) as a cyclic string of length n."""
+    n = len(grid)
+    for dr, dc in AXES:
+        for s in range(n):
+            r, c = (s, 0) if (dr, dc) == (0, 1) else (0, s)
+            yield "".join(grid[(r + k * dr) % n][(c + k * dc) % n] for k in range(n))
 
 
 def count_occurrences(grid, word):
+    """Brute force over every start cell and direction (slow, independent check)."""
     n = len(grid)
-    cnt = 0
-    for r in range(n):
-        for c in range(n):
-            for dr, dc in DIRS:
-                if all(grid[y][x] == ch for (y, x), ch in zip(_walk(n, r, c, dr, dc, len(word)), word)):
-                    cnt += 1
-    return cnt
+    return sum(all(grid[(r + k * dr) % n][(c + k * dc) % n] == ch for k, ch in enumerate(word))
+               for r in range(n) for c in range(n) for dr, dc in DIRS)
 
 
 def verify(grid, required, forbidden):
     n = len(grid)
-    if any(len(row) != n for row in grid):
+    if n == 0 or any(len(row) != n for row in grid):
         return False
-    if any(not ch.isupper() or ch not in string.ascii_uppercase for row in grid for ch in row):
+    if any(ch not in string.ascii_uppercase for row in grid for ch in row):
         return False
-    return (all(count_occurrences(grid, w) for w in required)
-            and not any(count_occurrences(grid, w) for w in forbidden))
+    # a word may wrap a line more than once, so repeat each cycle enough times
+    reps = max([len(w) for w in list(required) + list(forbidden)] + [1]) // n + 2
+    lines = [s * reps for s in _lines(grid)]
+
+    def present(w):
+        return any(w in s or w[::-1] in s for s in lines)
+
+    return all(present(w) for w in required) and not any(present(w) for w in forbidden)
 
 
-def _placements(cells, n, word):
-    """All (cell->letter) assignments for placing word, as dicts, consistent within themselves."""
-    seen = set()
-    for r in range(n):
-        for c in range(n):
-            for dr, dc in DIRS:
-                asg = {}
-                ok = True
-                for pos, ch in zip(_walk(n, r, c, dr, dc, len(word)), word):
-                    if asg.setdefault(pos, ch) != ch:
-                        ok = False
-                        break
-                if ok:
-                    key = tuple(sorted(asg.items()))
-                    if key not in seen:
-                        seen.add(key)
-                        yield asg
+def _hit_checker(n, forbidden):
+    """hit(grid, cells): does any forbidden word run through one of these cells?
+    grid is a flat list with "." for empty cells, which never match."""
+    if not forbidden:
+        return lambda grid, cells: False
+    words = {v for f in forbidden for v in (f, f[::-1])}
+    pat = re.compile("|".join(map(re.escape, sorted(words, key=len, reverse=True))))
+    m = max(map(len, forbidden))
+
+    def hit(grid, cells):
+        for cell in cells:
+            r, c = divmod(cell, n)
+            for dr, dc in AXES:
+                s = "".join(grid[((r + k * dr) % n) * n + (c + k * dc) % n] for k in range(1 - m, m))
+                if pat.search(s):
+                    return True
+        return False
+
+    return hit
 
 
-def _forbidden_hit(grid, n, forbidden, cells):
-    """True if a forbidden word is fully present in the partially filled grid
-    along a line through any of the given cells (others were already checked)."""
-    for (y, x) in cells:
-        for w in forbidden:
-            L = len(w)
-            for k in range(L):
-                for dr, dc in DIRS:
-                    r0, c0 = (y - k * dr) % n, (x - k * dc) % n
-                    if all(grid[(r0 + j * dr) % n][(c0 + j * dc) % n] == w[j] for j in range(L)):
-                        return True
-    return False
+def _greedy(n, words, hit, safe, rng):
+    """Place words one by one, preferring maximum overlap with letters already
+    down, else the first free spot in a scan. Returns rows or None."""
+    grid = ["."] * (n * n)
+    where = {}  # letter -> cells holding it
 
+    def cells_of(r0, c0, dr, dc, length):
+        return [((r0 + j * dr) % n) * n + (c0 + j * dc) % n for j in range(length)]
 
-def _try(n, required, forbidden, deadline, rng):
-    grid = [[None] * n for _ in range(n)]
-    cand = {w: list(_placements(None, n, w)) for w in set(required)}
-    if any(not v for v in cand.values()):
-        return None
-    words = sorted(set(required), key=lambda w: (-len(w), w))
-    forb_letters = set("".join(forbidden))
-
-    def fill():
-        blanks = [(r, c) for r in range(n) for c in range(n) if grid[r][c] is None]
-        rng.shuffle(blanks)
-        done = []
-        letters = list(string.ascii_uppercase)
-        for r, c in blanks:
-            # prefer letters absent from every forbidden word, else any that doesn't complete one
-            rng.shuffle(letters)
-            letters.sort(key=lambda ch: ch in forb_letters)
-            for ch in letters:
-                grid[r][c] = ch
-                if not _forbidden_hit(grid, n, forbidden, [(r, c)]):
-                    break
-            else:
-                grid[r][c] = None
-                for y, x in done:
-                    grid[y][x] = None
-                return False
-            done.append((r, c))
+    def place(cells, w):
+        new = [p for p in cells if grid[p] == "."]
+        for p, ch in zip(cells, w):
+            grid[p] = ch
+        if hit(grid, new):
+            for p in new:
+                grid[p] = "."
+            return False
+        for p in new:
+            where.setdefault(grid[p], []).append(p)
         return True
 
-    def dfs(i):
-        if time.time() > deadline:
-            return False
-        if i == len(words):
-            return fill()
-        w = words[i]
-        opts = []
-        for asg in cand[w]:
-            conflict = False
-            new = 0
-            for (r, c), ch in asg.items():
-                cur = grid[r][c]
-                if cur is None:
-                    new += 1
-                elif cur != ch:
-                    conflict = True
-                    break
-            if not conflict:
-                opts.append((new + rng.random(), asg))  # prefer max overlap
-        opts.sort(key=lambda t: t[0])
-        for _, asg in opts[:40]:
-            newcells = [p for p in asg if grid[p[0]][p[1]] is None]
-            for (r, c), ch in asg.items():
-                grid[r][c] = ch
-            if not _forbidden_hit(grid, n, forbidden, newcells) and dfs(i + 1):
-                return True
-            for r, c in newcells:
-                grid[r][c] = None
-            if time.time() > deadline:
-                return False
-        return False
+    def overlap_options(w):
+        """Placements sharing at least one letter, as (new cells + noise, cells),
+        or None if the word is already fully in the grid."""
+        seen, opts = set(), []
+        for k, ch in enumerate(w):
+            for cell in where.get(ch, ()):
+                r, c = divmod(cell, n)
+                for dr, dc in DIRS:
+                    key = ((r - k * dr) % n, (c - k * dc) % n, dr, dc)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    cells = cells_of(*key, len(w))
+                    new = 0
+                    for p, x in zip(cells, w):
+                        if grid[p] == ".":
+                            new += 1
+                        elif grid[p] != x:
+                            break
+                    else:
+                        if new == 0:
+                            return None
+                        opts.append((new + rng.random(), cells))
+        return sorted(opts, key=lambda t: t[0])
 
-    return ["".join(row) for row in grid] if dfs(0) else None
+    dir_order = DIRS[:]
+    rng.shuffle(dir_order)
+    for w in words:
+        opts = overlap_options(w)
+        if opts is None or any(place(cells, w) for _, cells in opts[:20]):
+            continue
+        # no overlap possible: first free spot, scanning from a random offset
+        off = rng.randrange(n * n)
+        if not any(place(cells, w)
+                   for dr, dc in dir_order
+                   for i in range(n * n)
+                   for cells in [cells_of(*divmod((i + off) % (n * n), n), dr, dc, len(w))]
+                   if all(grid[p] == "." or grid[p] == x for p, x in zip(cells, w))):
+            return None
+    # fill: letters absent from every forbidden word can never complete one
+    blanks = [p for p in range(n * n) if grid[p] == "."]
+    for p in blanks:
+        if safe:
+            grid[p] = rng.choice(safe)
+            continue
+        letters = list(string.ascii_uppercase)
+        rng.shuffle(letters)
+        for ch in letters:
+            grid[p] = ch
+            if not hit(grid, [p]):
+                break
+        else:
+            return None
+    return ["".join(grid[r * n:(r + 1) * n]) for r in range(n)]
 
 
-def _solve_size(n, required, forbidden, budget, rng):
-    end = time.time() + budget
-    while time.time() < end:
-        g = _try(n, required, forbidden, min(end, time.time() + 0.5), rng)
-        if g and verify(g, required, forbidden):
-            return g
-    return None
+def _row_layout(n, words, sep):
+    """Guaranteed-valid construction (if the input is feasible): words packed
+    into every other row, each followed by a separator letter that appears in
+    no forbidden word, other rows all separator. Any line of 2+ letters other
+    than inside one word then contains a separator. Returns rows or None."""
+    rows = [[] for _ in range(n // 2)]
+    space = [n] * len(rows)
+    for w in sorted(words, key=len, reverse=True):  # first-fit decreasing
+        for i in range(len(rows)):
+            if space[i] >= len(w) + 1:
+                rows[i].append(w)
+                space[i] -= len(w) + 1
+                break
+        else:
+            return None
+    out = [sep * n] * n
+    for i, ws in enumerate(rows):
+        out[2 * i] = "".join(w + sep for w in ws).ljust(n, sep)
+    return out
 
 
 def generate_grid(required_words, forbidden_words, total_seconds=3.0, seed=0):
     """Validity first (invalid scores 0), then shrink N toward the longest word."""
-    required = list(dict.fromkeys(w.upper() for w in required_words))
-    forbidden = [w.upper() for w in forbidden_words]
+    deadline = time.time() + total_seconds
     rng = random.Random(seed)
-    start = time.time()
-    lo = max([1] + [len(w) for w in required])  # hard lower bound
-    hi = max(lo, len(required))                  # score-10 upper bound
+    required = list(dict.fromkeys(w.upper() for w in required_words if w))
+    forbidden = list(dict.fromkeys(w.upper() for w in forbidden_words if w))
+    forb_letters = set("".join(forbidden))
+    safe = [ch for ch in string.ascii_uppercase if ch not in forb_letters]
+    if not required:
+        return [safe[0] if safe else "A"]
+    # words contained in a longer one (either direction) come for free
+    core = []
+    for w in sorted(required, key=len, reverse=True):
+        if not any(w in v or w[::-1] in v for v in core):
+            core.append(w)
+    lo = len(core[0])  # hard lower bound
     best = None
-    # phase 1: any valid grid, growing N until one is found
-    cap = 3 * hi + 10  # infeasible input (e.g. a required word contains a forbidden one): give up
-    while best is None:
-        best = _solve_size(hi, required, forbidden, 2.0, rng)
+
+    if safe:
+        n = max(lo + 1, 2)
+        while (g := _row_layout(n, core, safe[0])) is None:
+            n += 1
+        if verify(g, required, forbidden):
+            best = g
+
+    def attempt(n, until):
+        hit = _hit_checker(n, forbidden)
+        while time.time() < until:
+            words = sorted(core, key=lambda w: -len(w) - rng.random() * 2)
+            g = _greedy(n, words, hit, safe, rng)
+            if g and verify(g, required, forbidden):
+                return g
+        return None
+
+    if best is None:  # no separator letter: grow N from an area estimate
+        n = max(lo, math.isqrt(sum(map(len, core))))
+        while best is None and time.time() < deadline:
+            best = attempt(n, min(deadline, time.time() + 0.3))
+            n += 1
         if best is None:
-            hi += 1
-            if hi > cap:
-                return ["A" * lo] * lo
-    # phase 2: binary search for smaller N within the time budget
+            return ["A" * lo] * lo  # infeasible input or out of time
+
+    # binary search below the best size found so far
     hi = len(best)
-    while lo < hi and time.time() - start < total_seconds:
+    while lo < hi and time.time() < deadline:
+        steps = max(1, math.ceil(math.log2(hi - lo + 1)))
         mid = (lo + hi) // 2
-        g = _solve_size(mid, required, forbidden,
-                        min(1.0, max(0.2, total_seconds - (time.time() - start))), rng)
+        g = attempt(mid, time.time() + (deadline - time.time()) / (steps + 1))
         if g:
             best, hi = g, mid
         else:
             lo = mid + 1
+    # spend any leftover time one step below the best
+    while len(best) - 1 >= len(core[0]) and time.time() < deadline:
+        g = attempt(len(best) - 1, deadline)
+        if not g:
+            break
+        best = g
     return best
 
 
