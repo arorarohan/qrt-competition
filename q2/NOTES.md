@@ -39,6 +39,24 @@ The fast and slow checkers agreed on all of these.
 
 Before this rewrite, 25 words gave N=30 in 15s.
 
+## Status
+The current `solution.py` (pure-Python greedy) passed all the official test cases.
+
+## numpy experiment (`experimental_numpy.py`, not used)
+- numpy is installed in `q2/.venv`, which is gitignored. Create it with `python3 -m venv .venv && .venv/bin/pip install numpy`; system pip is blocked by PEP 668.
+- I tried a min-conflicts local search at fixed N. It vectorizes scoring every placement of one word, but with a 2s budget it lost to the greedy:
+
+| U | N | local search | greedy |
+|---|---|---|---|
+| 25 | 11 | failed | 0.38s |
+| 40 | 15 | failed | 0.01s |
+
+- Profile: about 5k moves/s. Half the time goes to Python overhead and half to recomputing the per-word clash every move.
+- Ideas if revisited:
+  - start from the greedy result instead of random placements;
+  - update clash counts incrementally;
+  - add breakout clause weighting to escape local minima.
+
 ## Possible next steps
 - Get the real time limit and input sizes. A longer budget will directly improve large-input N.
 - The greedy is slow for 100+ words, because overlap enumeration scales with N². Indexing placements could help.
