@@ -1,9 +1,12 @@
 """Compare solution.py and solution_improved.py: validity (brute-force checked),
 grid size, score and runtime. Usage: python3 compare.py [seconds_per_case]"""
+import os
 import random
 import string
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # solution_improved.py lives one level up
 
 import solution
 import solution_improved

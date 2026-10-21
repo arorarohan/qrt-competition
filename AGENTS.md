@@ -12,6 +12,10 @@ Guidance for AI coding agents (Claude Code, Codex, etc.) working in this reposit
 
 - `q1/`, `q2/`, `q3/`, `q4/`: one folder per problem (assumed mapping, confirm when problems are released). Currently each holds only a placeholder `lighthouses.txt` that can be deleted.
 
+## Problem status
+
+- **Q2 (Word Search Generation): DONE. Do not modify anything in `q2/`.** The submission is `q2/solution_improved.py`, which passed the judge. Everything else is archived in `q2/archive/`. See `q2/README.md`.
+
 ## Working rules
 
 - Time is the scarce resource. Get a simple correct solution passing the given examples first, then optimise.
