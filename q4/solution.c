@@ -1,27 +1,30 @@
 /*
- * Masyu solver for the HackerRank stub:
+ * Masyu solver v2 for the HackerRank stub:
  *
  *     char** solve(int grid_count, char** grid, int* result_count)
  *
- * C port of solution.py's strategy, run against a wall clock:
- *   1. rectangle constructions (perimeters, serpentine cycles)
- *   2. row-by-row frontier search with memoised dead states
- *   3. annealing on 2x2 flips of a rectangle cycle cover, then merging cycles
+ * Edge-based constraint propagation with backtracking (the standard way to
+ * solve Masyu).  Every edge between neighbouring cells is UNKNOWN, ON or OFF.
+ * Rules applied to a fixpoint after every change:
+ *   - a cell has 0 or 2 ON edges (a pearl exactly 2);
+ *   - black: turn, and go straight through the next cell on both sides;
+ *   - white: go straight, and turn in at least one neighbour;
+ *   - no premature loop: the two ends of a partial path may only be joined
+ *     when that closes the final loop (every ON edge and every pearl on it).
+ * When propagation stalls we branch on an edge at the end of a path (ON
+ * first, towards the nearest unvisited pearl, which keeps loops short).
  *
- * Every candidate goes through loop_len() (full validator) before it can be
- * kept, and the shortest valid loop wins.  Once a valid loop exists we stop
- * improving at ~0.9 s (the first second is free); with none we keep searching
- * up to 8.8 s, since a slow valid answer beats an invalid one.
+ * Once a loop is found we keep searching with branch and bound for a
+ * shorter one until ~0.9 s (the first second is free).  With no loop yet we
+ * search until HARD_LIMIT.
  *
  * Paste everything above the LOCAL main into HackerRank (keep its own main).
- * Local build:  python -m ziglang cc -O2 -DLOCAL solution.c -o masyu.exe
+ * Local build:  gcc -O2 -DLOCAL solution.c -o masyu -lm
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
-#include <limits.h>
 #include <math.h>
 #ifdef _WIN32
 #include <windows.h>
@@ -29,28 +32,26 @@
 #include <time.h>
 #endif
 
-#define MAXN 52
-#define WB 1
-#define EB 2
-#define NB 4
-#define SB 8
+#define MAXN 50
+#define MAXCELL (MAXN * MAXN)
+#define MAXE (2 * MAXCELL + 1)
+#define TRAIL_MAX (1 << 21)
 
-typedef unsigned char Grid[MAXN][MAXN];
+#define UNK 0
+#define ON 1
+#define OFF 2
 
-static int R, C;
-static char G[MAXN][MAXN];
-static int npearl, pearl_r[MAXN * MAXN], pearl_c[MAXN * MAXN];
-static int minr, maxr, minc, maxc;
+#ifndef DFS_FIND
+#define DFS_FIND 0.35
+#endif
+#define IMPROVE_UNTIL 0.9
+#define HARD_LIMIT 6.0
 
-static Grid best;
-static int best_len;
+/* N, E, S, W; opposite direction is (d + 2) & 3 */
+static const int DR[4] = {-1, 0, 1, 0};
+static const int DC[4] = {0, 1, 0, -1};
 
-/* N, E, S, W; opposite direction is (k + 2) & 3 */
-static const int DBIT[4] = {NB, EB, SB, WB};
-static const int DRow[4] = {-1, 0, 1, 0};
-static const int DCol[4] = {0, 1, 0, -1};
-
-/* ---------- timing and rng ---------- */
+/* ---------- timing ---------- */
 
 static double t_start;
 
@@ -73,663 +74,715 @@ static double wall_now(void) {
 
 static double elapsed(void) { return wall_now() - t_start; }
 
-static uint64_t rng_state = 88172645463325252ULL;
+/* ---------- board ---------- */
 
-static uint64_t rng(void) {
+static int R, C, NCELL, NE, EOFF;   /* EOFF: sentinel edge, always OFF (borders) */
+static char pearl[MAXCELL];         /* 0, 'W' or 'B' */
+static int npearl, pearl_list[MAXCELL];
+static int nb[MAXCELL][4];          /* neighbour cell or -1 */
+static int ce[MAXCELL][4];          /* edge id towards direction d (EOFF at border) */
+static int eu[MAXE], ev[MAXE];      /* edge endpoints */
+static int near_cnt[MAXCELL], near_list[MAXCELL][25];  /* pearls within 2 */
+
+/* ---------- search state (every write goes through the trail) ---------- */
+
+static int st[MAXE];
+static int don[MAXCELL], dunk[MAXCELL];   /* ON / UNKNOWN edge counts */
+static int mate[MAXCELL], plen[MAXCELL];  /* valid at path ends (don == 1) */
+static int total_on, touched, nends, closed_;
+
+static int *tr_addr[TRAIL_MAX];
+static int tr_old[TRAIL_MAX];
+static int tp;
+
+static void tset(int *a, int v) {
+    tr_addr[tp] = a;
+    tr_old[tp] = *a;
+    tp++;
+    *a = v;
+}
+
+static void undo(int mark) {
+    while (tp > mark) {
+        tp--;
+        *tr_addr[tp] = tr_old[tp];
+    }
+}
+
+/* ---------- propagation queue ---------- */
+
+static int queue[MAXCELL + 1], qh, qt;
+static char inq[MAXCELL];
+
+static void push(int x) {
+    if (inq[x]) return;
+    inq[x] = 1;
+    queue[qt] = x;
+    qt = qt == MAXCELL ? 0 : qt + 1;
+}
+
+static void clear_queue(void) {
+    while (qh != qt) {
+        inq[queue[qh]] = 0;
+        qh = qh == MAXCELL ? 0 : qh + 1;
+    }
+}
+
+static void touch(int x) {
+    push(x);
+    for (int i = 0; i < near_cnt[x]; ++i) push(near_list[x][i]);
+}
+
+static int edge_between(int x, int y) {
+    for (int d = 0; d < 4; ++d)
+        if (nb[x][d] == y) return ce[x][d];
+    return -1;
+}
+
+static int is_on(int e) { return st[e] == ON; }
+static int is_off(int e) { return st[e] == OFF; }
+
+/* Returns 0 on contradiction. */
+static int set_edge(int e, int v) {
+    if (st[e] == v) return 1;
+    if (st[e] != UNK) return 0;
+    if (v == ON && closed_) return 0;
+    int a = eu[e], b = ev[e];
+    tset(&st[e], v);
+    tset(&dunk[a], dunk[a] - 1);
+    tset(&dunk[b], dunk[b] - 1);
+    touch(a);
+    touch(b);
+    if (v == OFF) return 1;
+
+    if (don[a] == 2 || don[b] == 2) return 0;
+    int closing = don[a] == 1 && don[b] == 1 && mate[a] == b;
+    int ea = don[a] ? mate[a] : a, la = don[a] ? plen[a] : 0;
+    int eb = don[b] ? mate[b] : b, lb = don[b] ? plen[b] : 0;
+    int ends = nends;
+    ends += don[a] ? -1 : 1;
+    ends += don[b] ? -1 : 1;
+    tset(&nends, ends);
+    tset(&don[a], don[a] + 1);
+    tset(&don[b], don[b] + 1);
+    tset(&total_on, total_on + 1);
+    if (pearl[a] && don[a] == 1) tset(&touched, touched + 1);
+    if (pearl[b] && don[b] == 1) tset(&touched, touched + 1);
+
+    if (closing) {
+        if (la + 1 != total_on || touched != npearl) return 0;
+        tset(&closed_, 1);
+        return 1;
+    }
+    int len = la + lb + 1;
+    tset(&mate[ea], eb);
+    tset(&mate[eb], ea);
+    tset(&plen[ea], len);
+    tset(&plen[eb], len);
+    /* Joining the new ends would close a loop; only allowed if it is final. */
+    int f = edge_between(ea, eb);
+    if (f >= 0 && st[f] == UNK && !(len == total_on && touched == npearl))
+        return set_edge(f, OFF);
+    return 1;
+}
+
+static int cell_rule(int x) {
+    int on = don[x], unk = dunk[x];
+    if (on > 2) return 0;
+    if (on == 2) {
+        if (unk)
+            for (int d = 0; d < 4; ++d)
+                if (st[ce[x][d]] == UNK && !set_edge(ce[x][d], OFF)) return 0;
+        return 1;
+    }
+    if (on == 1) {
+        if (unk == 0) return 0;
+        if (unk == 1)
+            for (int d = 0; d < 4; ++d)
+                if (st[ce[x][d]] == UNK) return set_edge(ce[x][d], ON);
+        return 1;
+    }
+    if (pearl[x]) {
+        if (unk < 2) return 0;
+        if (unk == 2)
+            for (int d = 0; d < 4; ++d)
+                if (st[ce[x][d]] == UNK && !set_edge(ce[x][d], ON)) return 0;
+        return 1;
+    }
+    if (unk == 1 || closed_)
+        for (int d = 0; d < 4; ++d)
+            if (st[ce[x][d]] == UNK && !set_edge(ce[x][d], OFF)) return 0;
+    return 1;
+}
+
+static int black_rule(int p) {
+    for (int d = 0; d < 4; ++d) {
+        int q = nb[p][d];
+        if (q < 0) continue;  /* edge is the OFF sentinel */
+        int e = ce[p][d];
+        int ok = !is_off(e) && !is_off(ce[q][d]) &&
+                 !is_on(ce[q][(d + 1) & 3]) && !is_on(ce[q][(d + 3) & 3]);
+        if (!ok && !set_edge(e, OFF)) return 0;
+    }
+    for (int d = 0; d < 2; ++d) {
+        int a = ce[p][d], b = ce[p][d + 2];
+        if (is_off(a) && !set_edge(b, ON)) return 0;
+        if (is_off(b) && !set_edge(a, ON)) return 0;
+        if (is_on(a) && !set_edge(b, OFF)) return 0;
+        if (is_on(b) && !set_edge(a, OFF)) return 0;
+    }
+    for (int d = 0; d < 4; ++d)
+        if (is_on(ce[p][d]) && !set_edge(ce[nb[p][d]][d], ON)) return 0;
+    return 1;
+}
+
+/* Can white pearl p run along axis d (d = 0 vertical, 1 horizontal)? */
+static int white_axis_possible(int p, int d) {
+    int a = ce[p][d], b = ce[p][d + 2];
+    if (is_off(a) || is_off(b)) return 0;
+    /* both neighbours straight on this axis means no turn next to the pearl */
+    return !(is_on(ce[nb[p][d]][d]) && is_on(ce[nb[p][d + 2]][d + 2]));
+}
+
+static int white_rule(int p) {
+    int vpos = white_axis_possible(p, 0), hpos = white_axis_possible(p, 1);
+    if (!vpos && !hpos) return 0;
+    for (int axis = 0; axis < 2; ++axis) {
+        int other = 1 - axis;
+        int possible = axis == 0 ? vpos : hpos;
+        int a = ce[p][axis], b = ce[p][axis + 2];
+        if (!possible || is_on(ce[p][other]) || is_on(ce[p][other + 2])) {
+            if (!set_edge(a, OFF) || !set_edge(b, OFF)) return 0;
+            if (!set_edge(ce[p][other], ON) || !set_edge(ce[p][other + 2], ON)) return 0;
+            continue;
+        }
+        if (is_on(a) && is_on(b)) {
+            int na = ce[nb[p][axis]][axis], nbb = ce[nb[p][axis + 2]][axis + 2];
+            if (is_on(na) && !set_edge(nbb, OFF)) return 0;
+            if (is_on(nbb) && !set_edge(na, OFF)) return 0;
+        }
+    }
+    return 1;
+}
+
+static int propagate(void) {
+    while (qh != qt) {
+        int x = queue[qh];
+        qh = qh == MAXCELL ? 0 : qh + 1;
+        inq[x] = 0;
+        int ok = cell_rule(x);
+        if (ok && pearl[x] == 'B') ok = black_rule(x);
+        if (ok && pearl[x] == 'W') ok = white_rule(x);
+        if (!ok) {
+            clear_queue();
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* ---------- search ---------- */
+
+static unsigned char best_st[MAXE];
+static int best_len, have_best;
+static long long nodes, node_cap;
+static int aborted, cut, improving, attempt;
+static double limit_time;
+
+static unsigned long long rng_state = 88172645463325252ULL;
+
+static unsigned rnd(void) {
     rng_state ^= rng_state << 13;
     rng_state ^= rng_state >> 7;
     rng_state ^= rng_state << 17;
-    return rng_state;
+    return (unsigned)(rng_state >> 32);
 }
 
-static double rng01(void) { return (rng() >> 11) * (1.0 / 9007199254740992.0); }
+/* Every used cell and untouched pearl must stay mutually reachable through
+ * edges that are not OFF, or no single loop can contain them all. */
+static int seen_stamp[MAXCELL], stamp, bfs_q[MAXCELL], bdist[MAXCELL];
 
-/* ---------- validation ---------- */
-
-static int is_turn(int m) {
-    return m == (NB | EB) || m == (NB | WB) || m == (SB | EB) || m == (SB | WB);
-}
-
-static int is_tile(int m) {
-    return m == (WB | EB) || m == (NB | SB) || is_turn(m);
-}
-
-static int pearl_cost(Grid m, int r, int c) {
-    int mask = m[r][c];
-    if (G[r][c] == 'W') {
-        if (mask != (WB | EB) && mask != (NB | SB)) return 3;
-        if (mask == (WB | EB))
-            return ((c > 0 && is_turn(m[r][c - 1])) ||
-                    (c + 1 < C && is_turn(m[r][c + 1]))) ? 0 : 1;
-        return ((r > 0 && is_turn(m[r - 1][c])) ||
-                (r + 1 < R && is_turn(m[r + 1][c]))) ? 0 : 1;
-    }
-    if (G[r][c] == 'B') {
-        if (!is_turn(mask)) return 3;
-        int cost = 0;
-        for (int k = 0; k < 4; ++k) {
-            if (!(mask & DBIT[k])) continue;
-            int rr = r + DRow[k], cc = c + DCol[k];
-            int straight = (k & 1) ? (WB | EB) : (NB | SB);
-            if (rr < 0 || rr >= R || cc < 0 || cc >= C || m[rr][cc] != straight)
-                cost++;
+static int connected(void) {
+    int start = -1;
+    for (int i = 0; i < npearl && start < 0; ++i) start = pearl_list[i];
+    int need = total_on + nends / 2 + (npearl - touched);
+    stamp++;
+    int h = 0, t = 0, found = 0;
+    bfs_q[t++] = start;
+    seen_stamp[start] = stamp;
+    while (h < t) {
+        int x = bfs_q[h++];
+        if (don[x] || pearl[x]) found++;
+        for (int d = 0; d < 4; ++d) {
+            int y = nb[x][d];
+            if (y >= 0 && st[ce[x][d]] != OFF && seen_stamp[y] != stamp) {
+                seen_stamp[y] = stamp;
+                bfs_q[t++] = y;
+            }
         }
-        return cost;
     }
+    return found == need;
+}
+
+static void record(void) {
+    if (have_best && total_on >= best_len) return;
+    for (int e = 0; e < NE; ++e) best_st[e] = st[e] == ON;
+    best_len = total_on;
+    have_best = 1;
+}
+
+/* Pick the edge to branch on.  Returns -1 when nothing is left to decide.
+ * With pearl_first, untouched pearls go first (fixing a pearl's orientation
+ * propagates far).  Otherwise the most constrained path end, heading for the
+ * nearest untouched pearl or the nearest end of another path. */
+static int pearl_first;
+
+static int choose_edge(void) {
+    int x = -1, ties = 0;
+    if (pearl_first) {
+        for (int i = 0; i < npearl; ++i) {
+            int p = pearl_list[i];
+            if (don[p] != 0) continue;
+            if (x < 0 || dunk[p] < dunk[x]) {
+                x = p;
+                ties = 1;
+            } else if (dunk[p] == dunk[x] && attempt && rnd() % ++ties == 0) {
+                x = p;
+            }
+        }
+        if (x >= 0) {
+            int first = attempt ? (int)(rnd() & 3) : 0;
+            for (int k = 0; k < 4; ++k)
+                if (st[ce[x][(first + k) & 3]] == UNK) return ce[x][(first + k) & 3];
+        }
+    }
+
+    /* most constrained path end; ties broken at random after the first attempt */
+    x = -1;
+    ties = 0;
+    for (int i = 0; i < NCELL; ++i) {
+        if (don[i] != 1) continue;
+        if (x < 0 || dunk[i] < dunk[x]) {
+            x = i;
+            ties = 1;
+        } else if (dunk[i] == dunk[x] && attempt && rnd() % ++ties == 0) {
+            x = i;
+        }
+    }
+    if (x < 0) {
+        /* no path yet: start at an untouched pearl */
+        for (int i = 0; i < npearl; ++i)
+            if (don[pearl_list[i]] == 0) { x = pearl_list[i]; break; }
+        if (x < 0) return -1;
+    }
+
+    /* Multi-source BFS from everything x may head for (untouched pearls and
+     * the ends of other paths) through free cells, so the chosen direction
+     * goes around existing paths instead of into them. */
+    int h = 0, t = 0;
+    stamp++;
+    for (int i = 0; i < npearl; ++i) {
+        int p = pearl_list[i];
+        if (don[p] == 0 && p != x) { seen_stamp[p] = stamp; bdist[p] = 0; bfs_q[t++] = p; }
+    }
+    if (don[x] == 1)
+        for (int y = 0; y < NCELL; ++y)
+            if (don[y] == 1 && y != x && y != mate[x]) { seen_stamp[y] = stamp; bdist[y] = 0; bfs_q[t++] = y; }
+    if (t == 0 && don[x] == 1) {   /* only this path left: close it */
+        seen_stamp[mate[x]] = stamp;
+        bdist[mate[x]] = 0;
+        bfs_q[t++] = mate[x];
+    }
+    while (h < t) {
+        int u = bfs_q[h++];
+        for (int d = 0; d < 4; ++d) {
+            int w = nb[u][d];
+            if (w >= 0 && don[w] == 0 && st[ce[u][d]] != OFF && seen_stamp[w] != stamp) {
+                seen_stamp[w] = stamp;
+                bdist[w] = bdist[u] + 1;
+                bfs_q[t++] = w;
+            }
+        }
+    }
+
+    int best_e = -1, best_score = 1 << 30;
+    for (int d = 0; d < 4; ++d) {
+        int e = ce[x][d];
+        if (st[e] != UNK) continue;
+        int y = nb[x][d];
+        int s = (seen_stamp[y] == stamp ? 4 * bdist[y] : 1 << 20) + (attempt ? (int)(rnd() % 7) : 0);
+        if (s < best_score) { best_score = s; best_e = e; }
+    }
+    return best_e;
+}
+
+/* Probing (failed literals): if setting an edge one way leads straight to a
+ * contradiction, it must go the other way.  Only edges at undecided pearls
+ * and path ends are probed, which is where the deductions happen (e.g. three
+ * whites in a row). */
+static int probe_list[MAXE], probe_seen[MAXE], probe_stamp;
+
+static int consistent(int e, int v) {
+    int mark = tp;
+    int ok = set_edge(e, v) && propagate();
+#ifdef PROBE_CONN
+    if (ok && !closed_) ok = connected();
+#endif
+    if (ok && closed_) record();
+    undo(mark);
+    clear_queue();
+    return ok;
+}
+
+static int probe(void) {
+    for (int round = 0; round < 4; ++round) {
+        int n = 0, changed = 0;
+        probe_stamp++;
+        for (int x = 0; x < NCELL; ++x) {
+            if (!(don[x] == 1 || (pearl[x] && don[x] == 0))) continue;
+            for (int d = 0; d < 4; ++d) {
+                int e = ce[x][d];
+                if (st[e] == UNK && probe_seen[e] != probe_stamp) {
+                    probe_seen[e] = probe_stamp;
+                    probe_list[n++] = e;
+                }
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            int e = probe_list[i];
+            if (st[e] != UNK) continue;
+            int v = !consistent(e, ON) ? OFF : !consistent(e, OFF) ? ON : UNK;
+            if (v == UNK) continue;
+            if (!set_edge(e, v) || !propagate()) return 0;
+            changed = 1;
+            if (closed_) return 1;
+        }
+        if (!changed) break;
+    }
+    return 1;
+}
+
+/* Returns 1 to stop the search (first loop found while not improving). */
+static int dfs(void) {
+    if ((++nodes & 255) == 0 && elapsed() > limit_time) aborted = 1;
+    if (nodes > node_cap) cut = 1;
+    if (aborted || cut) return 1;
+    if (!propagate()) return 0;
+#ifndef NO_PROBE
+    if (!probe()) return 0;
+#endif
+    if (!closed_ && !connected()) return 0;
+#ifdef STATS
+    {
+        static int root_done;
+        extern int stat_known, stat_root_on, stat_max_touched, stat_max_on;
+        if (!root_done) {
+            root_done = 1;
+            for (int e = 0; e < NE; ++e) stat_known += st[e] != UNK;
+            stat_root_on = total_on;
+        }
+        if (touched > stat_max_touched) stat_max_touched = touched;
+        if (total_on > stat_max_on) stat_max_on = total_on;
+    }
+#endif
+    if (closed_) {
+        record();
+        return !improving;
+    }
+    /* loop length = cells on it >= cells already used + untouched pearls */
+    if (have_best && total_on + nends / 2 + (npearl - touched) >= best_len) return 0;
+
+    int e = choose_edge();
+    if (e < 0) return 0;
+    int mark = tp;
+    if (set_edge(e, ON) && dfs()) return 1;
+    undo(mark);
+    clear_queue();
+    if (aborted || cut) return 1;
+    if (set_edge(e, OFF) && dfs()) return 1;
+    undo(mark);
+    clear_queue();
     return 0;
 }
 
-/* Loop length if m is a valid answer, else 0. */
-static int loop_len(Grid m) {
-    int cells = 0, sr = -1, sc = -1;
-    for (int r = 0; r < R; ++r) {
-        for (int c = 0; c < C; ++c) {
-            int mask = m[r][c];
-            if (!mask) {
-                if (G[r][c] != '.') return 0;
-                continue;
-            }
-            if (!is_tile(mask)) return 0;
-            for (int k = 0; k < 4; ++k) {
-                if (!(mask & DBIT[k])) continue;
-                int rr = r + DRow[k], cc = c + DCol[k];
-                if (rr < 0 || rr >= R || cc < 0 || cc >= C) return 0;
-                if (!(m[rr][cc] & DBIT[(k + 2) & 3])) return 0;
-            }
-            if (sr < 0) { sr = r; sc = c; }
-            cells++;
-        }
-    }
-    if (!cells) return 0;
-
-    int r = sr, c = sc, from = -1, steps = 0;
-    do {
-        int mask = m[r][c], k;
-        for (k = 0; k < 4; ++k)
-            if ((mask & DBIT[k]) && k != from) break;
-        r += DRow[k];
-        c += DCol[k];
-        from = (k + 2) & 3;
-        steps++;
-    } while ((r != sr || c != sc) && steps <= cells);
-    if (steps != cells) return 0;
-
-    for (int i = 0; i < npearl; ++i)
-        if (pearl_cost(m, pearl_r[i], pearl_c[i])) return 0;
-    return cells;
-}
-
-static int consider(Grid m) {
-    int len = loop_len(m);
-    if (len && len < best_len) {
-        memcpy(best, m, sizeof(Grid));
-        best_len = len;
-    }
-    return len != 0;
-}
-
-static int have_answer(void) { return best_len != INT_MAX; }
-
-/* ---------- rectangle constructions ---------- */
-
-static int path_r[MAXN * MAXN], path_c[MAXN * MAXN];
-
-static void path_to_masks(Grid m, int n) {
-    memset(m, 0, sizeof(Grid));
-    for (int i = 0; i < n; ++i) {
-        int j = (i + 1) % n;
-        int dr = path_r[j] - path_r[i], dc = path_c[j] - path_c[i];
-        for (int k = 0; k < 4; ++k) {
-            if (DRow[k] == dr && DCol[k] == dc) {
-                m[path_r[i]][path_c[i]] |= DBIT[k];
-                m[path_r[j]][path_c[j]] |= DBIT[(k + 2) & 3];
-            }
-        }
+/* Restarts with a growing node budget: find a loop (until find_until), then,
+ * once one is known, look for strictly shorter ones until improve_until. */
+static void run_dfs(double find_until, double improve_until) {
+    long long budget = 2000;
+    for (attempt = 0;; ++attempt) {
+        limit_time = have_best ? improve_until : find_until;
+        if (elapsed() >= limit_time) break;
+        improving = have_best;
+        pearl_first = 0;
+        aborted = cut = 0;
+        node_cap = nodes + budget;
+        int mark = tp;
+        for (int x = 0; x < NCELL; ++x) push(x);
+        int stopped = dfs();
+        undo(mark);
+        clear_queue();
+        if (aborted) break;
+        if (!stopped && !cut) break;   /* tree exhausted: best is optimal */
+        if (!(stopped && !cut)) budget += budget / 2;
     }
 }
 
-/* Hamiltonian cycle of an h x w block (h even) in local coordinates. */
-static int gen_snake(int h, int w, int *pi, int *pj) {
+/* ---------- annealing on the region the loop encloses ----------
+ * A single loop is exactly the boundary of a hole-free, 4-connected set of
+ * faces (the squares between cell centres) with no two faces touching only
+ * at a corner.  Flipping one face while keeping that shape keeps a single
+ * loop, so every state is a loop and the cost is just the pearl violations
+ * (plus a small length term).  This finds loops where the DFS cannot join
+ * its path fragments. */
+
+static unsigned char fin[MAXN][MAXN];   /* face (r, c) spans cells r..r+1, c..c+1 */
+static int FR, FC;
+static const int RING_R[8] = {-1, -1, 0, 1, 1, 1, 0, -1};
+static const int RING_C[8] = {0, 1, 1, 1, 0, -1, -1, -1};
+
+static int face(int r, int c) {
+    return r >= 0 && r < FR && c >= 0 && c < FC ? fin[r][c] : 0;
+}
+
+/* N=1 E=2 S=4 W=8, same bits as tile_of */
+static int cmask(int x) {
+    int r = x / C, c = x % C;
+    int a = face(r - 1, c - 1), b = face(r - 1, c), cc = face(r, c - 1), d = face(r, c);
+    return (a != b) | (b != d) << 1 | (cc != d) << 2 | (a != cc) << 3;
+}
+
+static int is_turn(int m) { return m == 3 || m == 6 || m == 12 || m == 9; }
+
+static int pearl_cost(int p) {
+    int m = cmask(p);
+    if (pearl[p] == 'B') {
+        if (!m) return 4;
+        if (!is_turn(m)) return 3;
+        int k = 0;
+        for (int d = 0; d < 4; ++d)
+            if (m >> d & 1) k += cmask(nb[p][d]) != ((d & 1) ? 10 : 5);
+        return k;
+    }
+    if (!m) return 3;
+    if (m != 5 && m != 10) return 2;
+    int axis = m == 5 ? 0 : 1;
+    return !is_turn(cmask(nb[p][axis])) && !is_turn(cmask(nb[p][axis + 2]));
+}
+
+/* Can face (r, c) flip without breaking the single-loop shape? */
+static int flippable(int r, int c, int region_size) {
+    int me = fin[r][c], v[8];
+    if (me && region_size <= 1) return 0;
+    for (int i = 0; i < 8; ++i) v[i] = face(r + RING_R[i], c + RING_C[i]) != me;  /* "other side" */
+    /* after the flip, f joins the other side: it must touch it orthogonally,
+     * the ring must hold exactly one run of it, and no diagonal-only contact */
+    if (!(v[0] || v[2] || v[4] || v[6])) return 0;
+    int runs = 0;
+    for (int i = 0; i < 8; ++i) runs += v[i] && !v[(i + 7) & 7];
+    if (runs != 1) return 0;
+    for (int i = 1; i < 8; i += 2)
+        if (v[i] && !v[i - 1] && !v[(i + 1) & 7]) return 0;
+    return 1;
+}
+
+/* pearls whose cost reads a corner of face (r, c): 4x4 cells minus corners */
+static int affected(int r, int c, int *out) {
     int n = 0;
-    for (int j = 0; j < w; ++j) { pi[n] = 0; pj[n++] = j; }
-    for (int i = 1; i < h; ++i) {
-        if (i & 1)
-            for (int j = w - 1; j >= 1; --j) { pi[n] = i; pj[n++] = j; }
-        else
-            for (int j = 1; j < w; ++j) { pi[n] = i; pj[n++] = j; }
-    }
-    pi[n] = h - 1; pj[n++] = 0;
-    for (int i = h - 2; i >= 1; --i) { pi[n] = i; pj[n++] = 0; }
+    for (int i = r - 1; i <= r + 2; ++i)
+        for (int j = c - 1; j <= c + 2; ++j) {
+            if (i < 0 || i >= R || j < 0 || j >= C) continue;
+            if ((i == r - 1 || i == r + 2) && (j == c - 1 || j == c + 2)) continue;
+            if (pearl[i * C + j]) out[n++] = i * C + j;
+        }
     return n;
 }
 
-/* Serpentine cycle filling a rectangle; variant bits: 1 transpose, 2 flip rows, 4 flip cols. */
-static int build_snake(Grid m, int top, int left, int h, int w, int variant) {
-    static int li[MAXN * MAXN], lj[MAXN * MAXN];
-    int n;
-    if (variant & 1) {
-        if (w & 1) return 0;
-        n = gen_snake(w, h, li, lj);
-        for (int i = 0; i < n; ++i) { int t = li[i]; li[i] = lj[i]; lj[i] = t; }
-    } else {
-        if (h & 1) return 0;
-        n = gen_snake(h, w, li, lj);
-    }
-    for (int i = 0; i < n; ++i) {
-        int a = li[i], b = lj[i];
-        if (variant & 2) a = h - 1 - a;
-        if (variant & 4) b = w - 1 - b;
-        path_r[i] = top + a;
-        path_c[i] = left + b;
-    }
-    path_to_masks(m, n);
-    return 1;
-}
-
-static void build_perimeter(Grid m, int t, int l, int b, int rt) {
-    memset(m, 0, sizeof(Grid));
-    for (int c = l + 1; c < rt; ++c) m[t][c] = m[b][c] = WB | EB;
-    for (int r = t + 1; r < b; ++r) m[r][l] = m[r][rt] = NB | SB;
-    m[t][l] = SB | EB;
-    m[t][rt] = SB | WB;
-    m[b][l] = NB | EB;
-    m[b][rt] = NB | WB;
-}
-
-typedef struct { short t, l, b, r; int area; } Rect;
-
-static int cmp_rect(const void *x, const void *y) {
-    return ((const Rect *)x)->area - ((const Rect *)y)->area;
-}
-
-static void constructive(double deadline) {
-    static Grid m;
-
-    /* Perimeters of every rectangle containing the pearls' bounding box. */
-    for (int t = 0; t <= minr; ++t)
-        for (int b = maxr; b < R; ++b) {
-            if (b <= t) continue;
-            for (int l = 0; l <= minc; ++l)
-                for (int rt = maxc; rt < C; ++rt) {
-                    if (rt <= l) continue;
-                    if (2 * ((b - t) + (rt - l)) >= best_len) continue;
-                    int ok = 1;
-                    for (int i = 0; i < npearl && ok; ++i) {
-                        int r = pearl_r[i], c = pearl_c[i];
-                        ok = (r == t || r == b || c == l || c == rt);
-                    }
-                    if (!ok) continue;
-                    build_perimeter(m, t, l, b, rt);
-                    consider(m);
-                }
-        }
-
-    /* Serpentine cycles (length = area), smallest rectangles first. */
-    int cap = (minr + 1) * (R - maxr) * (minc + 1) * (C - maxc);
-    Rect *rects = malloc(sizeof(Rect) * (cap > 0 ? cap : 1));
-    if (!rects) return;
+static int corner_len(int r, int c) {
     int n = 0;
-    for (int t = 0; t <= minr; ++t)
-        for (int b = maxr; b < R; ++b)
-            for (int l = 0; l <= minc; ++l)
-                for (int rt = maxc; rt < C; ++rt) {
-                    int h = b - t + 1, w = rt - l + 1;
-                    if (h < 2 || w < 2 || ((h & 1) && (w & 1))) continue;
-                    rects[n].t = t; rects[n].l = l; rects[n].b = b; rects[n].r = rt;
-                    rects[n].area = h * w;
-                    n++;
-                }
-    qsort(rects, n, sizeof(Rect), cmp_rect);
-    for (int i = 0; i < n; ++i) {
-        if (rects[i].area >= best_len || elapsed() > deadline) break;
-        int h = rects[i].b - rects[i].t + 1, w = rects[i].r - rects[i].l + 1;
-        for (int v = 0; v < 8; ++v)
-            if (build_snake(m, rects[i].t, rects[i].l, h, w, v) && consider(m)) break;
+    for (int i = r; i <= r + 1; ++i)
+        for (int j = c; j <= c + 1; ++j) n += cmask(i * C + j) != 0;
+    return n;
+}
+
+static void record_faces(int len) {
+    if (have_best && len >= best_len) return;
+    for (int e = 0; e < NE; ++e) {
+        int u = eu[e], v = ev[e];
+        best_st[e] = (cmask(u) >> (v == u + 1 ? 1 : 2)) & 1;
     }
-    free(rects);
+    best_len = len;
+    have_best = 1;
 }
 
-/* ---------- row-by-row frontier search ---------- */
+#ifdef STATS
+static int sa_min_cost = 1 << 30;
+#endif
+static unsigned char known[MAXE];   /* root deductions: UNK, ON or OFF */
 
-enum { T_DOT, T_H, T_V, T_L, T_J, T_F, T_7 };
-static const int TILE_MASK[7] = {0, WB | EB, NB | SB, NB | EB, NB | WB, SB | EB, SB | WB};
-#define RQ_ALL 0x7f
-#define RQ_TURN 0x78
-#define RQ_H 0x02
-#define RQ_V 0x04
-#define RQ_WHITE 0x06
-
-/* Neighbour shape classes the pearl rules need: 0 other, 1 straight along the link, 2 turn. */
-static int top_class(int t) { return t == T_V ? 1 : t >= T_L ? 2 : 0; }
-static int left_class(int t) { return t == T_H ? 1 : t >= T_L ? 2 : 0; }
-
-#define MAXCELLS (MAXN * MAXN)
-static int dpR, dpC, dpTot;
-static char dpG[MAXN][MAXN];
-static unsigned char rem_pearl[MAXCELLS + 1];
-static unsigned char st_lab[MAXCELLS + 1][MAXN], st_req[MAXCELLS + 1][MAXN], st_shp[MAXCELLS + 1][MAXN];
-static unsigned char st_ll[MAXCELLS + 1], st_lq[MAXCELLS + 1], st_ls[MAXCELLS + 1], st_cl[MAXCELLS + 1];
-static unsigned char dp_tile[MAXCELLS];
-
-#define MEMO_BITS 22
-#define MEMO_CAP ((size_t)1 << MEMO_BITS)
-#define MEMO_LIMIT (MEMO_CAP / 10 * 7)
-static uint64_t *memo;
-static uint32_t *memo_slots;   /* filled slots, so clearing costs O(entries) */
-static size_t memo_count;
-static int dp_abort, dp_dot_first;
-static long dp_calls;
-static double dp_deadline;
-
-static uint64_t mix(uint64_t h, uint64_t v) {
-    h = (h ^ v) * 0x9E3779B97F4A7C15ULL;
-    return h ^ (h >> 31);
+/* the 4 edges on face (r, c)'s border: top, bottom, left, right */
+static void face_edges(int r, int c, int *e) {
+    e[0] = ce[r * C + c][1];
+    e[1] = ce[(r + 1) * C + c][1];
+    e[2] = ce[r * C + c][2];
+    e[3] = ce[r * C + c + 1][2];
 }
 
-static uint64_t dp_hash(int idx) {
-    uint64_t h = mix(0x1234567ULL, (uint64_t)idx);
-    for (int c = 0; c < dpC; ++c)
-        h = mix(h, st_lab[idx][c] | (st_req[idx][c] << 6) | (st_shp[idx][c] << 13));
-    h = mix(h, st_ll[idx] | (st_lq[idx] << 6) | (st_ls[idx] << 13) | (st_cl[idx] << 15));
-    return h | 1;
+/* edge e is ON when the faces on its two sides differ */
+static int face_edge_on(int e) {
+    int u = eu[e], r = u / C, c = u % C;
+    if (ev[e] == u + 1) return face(r - 1, c) != face(r, c);
+    return face(r, c - 1) != face(r, c);
 }
 
-static int memo_has(uint64_t k) {
-    size_t i = (size_t)(k >> 7) & (MEMO_CAP - 1);
-    while (memo[i]) {
-        if (memo[i] == k) return 1;
-        i = (i + 1) & (MEMO_CAP - 1);
+static int known_cost(int e) {
+    return known[e] != UNK && (known[e] == ON) != face_edge_on(e);
+}
+
+static void anneal(double until) {
+    FR = R - 1;
+    FC = C - 1;
+    /* start from the faces spanning the pearls' bounding box */
+    int r0 = R, r1 = 0, c0 = C, c1 = 0;
+    for (int i = 0; i < npearl; ++i) {
+        int r = pearl_list[i] / C, c = pearl_list[i] % C;
+        if (r < r0) r0 = r;
+        if (r > r1) r1 = r;
+        if (c < c0) c0 = c;
+        if (c > c1) c1 = c;
     }
-    return 0;
-}
-
-static void memo_add(uint64_t k) {
-    if (memo_count >= MEMO_LIMIT) { dp_abort = 1; return; }
-    size_t i = (size_t)(k >> 7) & (MEMO_CAP - 1);
-    while (memo[i]) {
-        if (memo[i] == k) return;
-        i = (i + 1) & (MEMO_CAP - 1);
-    }
-    memo[i] = k;
-    memo_slots[memo_count++] = (uint32_t)i;
-}
-
-static int dp_search(int idx) {
-    if (dp_abort) return 0;
-    if ((++dp_calls & 4095) == 0 && elapsed() > dp_deadline) { dp_abort = 1; return 0; }
-
-    unsigned char *tl = st_lab[idx], *tq = st_req[idx], *ts = st_shp[idx];
-    int ll = st_ll[idx], lq = st_lq[idx], ls = st_ls[idx], closed = st_cl[idx];
-
-    if (idx == dpTot) {
-        if (!closed) return 0;
-        for (int c = 0; c < dpC; ++c)
-            if (tl[c] || tq[c] != RQ_ALL) return 0;
-        return 1;
-    }
-
-    uint64_t key = dp_hash(idx);
-    if (memo_has(key)) return 0;
-
-    int r = idx / dpC, c = idx % dpC;
-    char pearl = dpG[r][c];
-    int nlab = tl[c], wlab = ll;
-    int req = tq[c] & lq;
-    if (pearl == 'W') req &= RQ_WHITE;
-    else if (pearl == 'B') req &= RQ_TURN;
-    if (!req) { memo_add(key); return 0; }
-
-    int cand[7], nc = 0;
-    if (closed) {
-        if (req & 1) cand[nc++] = T_DOT;
-    } else {
-        for (int t = 0; t < 7; ++t) {
-            int m = TILE_MASK[t];
-            if (((m & NB) != 0) != (nlab != 0)) continue;
-            if (((m & WB) != 0) != (wlab != 0)) continue;
-            if (c == dpC - 1 && (m & EB)) continue;
-            if (r == dpR - 1 && (m & SB)) continue;
-            if (!(req & (1 << t))) continue;
-            cand[nc++] = t;
+    if (r1 > FR - 1) r1 = FR - 1;
+    if (c1 > FC - 1) c1 = FC - 1;
+    if (r0 > r1) r0 = r1;
+    if (c0 > c1) c0 = c1;
+    int size = 0;
+    for (int r = 0; r < FR; ++r)
+        for (int c = 0; c < FC; ++c) {
+            fin[r][c] = r >= r0 && r <= r1 && c >= c0 && c <= c1;
+            size += fin[r][c];
         }
-        /* Empty cells are optional; trying skip first usually keeps loops short. */
-        if (!dp_dot_first && nc > 1 && cand[0] == T_DOT) {
-            for (int i = 1; i < nc; ++i) cand[i - 1] = cand[i];
-            cand[nc - 1] = T_DOT;
+    int cost = 0, len = 0;
+    for (int i = 0; i < npearl; ++i) cost += pearl_cost(pearl_list[i]);
+    for (int e = 0; e < NE; ++e) cost += known_cost(e);
+    for (int x = 0; x < NCELL; ++x) len += cmask(x) != 0;
+
+#ifndef SA_T0
+#define SA_T0 1.5
+#define SA_TMIN 0.15
+#define SA_DECAY 0.998
+#endif
+    const double lam = 0.02;
+    double temp = SA_T0;
+    int aff[16];
+    for (long long it = 0;; ++it) {
+        if ((it & 4095) == 0) {
+            double now = elapsed();
+            if (now >= until || (have_best && now >= IMPROVE_UNTIL)) break;
+            temp *= SA_DECAY;
+            if (temp < SA_TMIN) temp = SA_T0;   /* reheat */
+        }
+        int r, c;
+        if (rnd() % 10 < 8) {
+            /* work next to a violated pearl when one turns up quickly */
+            int p = pearl_list[rnd() % npearl];
+            for (int k = 0; k < 8 && cost && !pearl_cost(p); ++k) p = pearl_list[rnd() % npearl];
+            r = p / C - 2 + (int)(rnd() % 4);
+            c = p % C - 2 + (int)(rnd() % 4);
+            if (r < 0 || r >= FR || c < 0 || c >= FC) continue;
+        } else {
+            r = rnd() % FR;
+            c = rnd() % FC;
+        }
+        if (!flippable(r, c, size)) continue;
+        int n = affected(r, c, aff), fe[4];
+        face_edges(r, c, fe);
+        int before = 0, after = 0;
+        for (int i = 0; i < n; ++i) before += pearl_cost(aff[i]);
+        for (int i = 0; i < 4; ++i) before += known_cost(fe[i]);
+        int lb = corner_len(r, c);
+        fin[r][c] ^= 1;
+        for (int i = 0; i < n; ++i) after += pearl_cost(aff[i]);
+        for (int i = 0; i < 4; ++i) after += known_cost(fe[i]);
+        int la = corner_len(r, c);
+        double delta = (after - before) + lam * (la - lb);
+        if (delta <= 0 || (double)(rnd() % 1000000) / 1e6 < exp(-delta / temp)) {
+            cost += after - before;
+            len += la - lb;
+            size += fin[r][c] ? 1 : -1;
+            if (cost == 0) record_faces(len);
+#ifdef STATS
+            if (cost < sa_min_cost) sa_min_cost = cost;
+#endif
+        } else {
+            fin[r][c] ^= 1;
         }
     }
+}
 
-    for (int i = 0; i < nc; ++i) {
-        int t = cand[i], m = TILE_MASK[t];
-        int e_on = m & EB, s_on = m & SB, n_on = m & NB, w_on = m & WB;
-        int east_req = RQ_ALL, south_req = RQ_ALL;
+/* ---------- setup and output ---------- */
 
-        if (pearl == 'W') {
-            if (t == T_H) { if (ls != 2) east_req = RQ_TURN; }
-            else if (t == T_V) { if (ts[c] != 2) south_req = RQ_TURN; }
-            else continue;
-        } else if (pearl == 'B') {
-            if (n_on && ts[c] != 1) continue;
-            if (w_on && ls != 1) continue;
-            if (e_on) east_req = RQ_H;
-            if (s_on) south_req = RQ_V;
+static void build(char **grid) {
+    NCELL = R * C;
+    npearl = 0;
+    NE = 0;
+    for (int x = 0; x < NCELL; ++x) {
+        char ch = grid[x / C][x % C];
+        pearl[x] = (ch == 'W' || ch == 'B') ? ch : 0;
+        if (pearl[x]) pearl_list[npearl++] = x;
+    }
+    for (int x = 0; x < NCELL; ++x)
+        for (int d = 0; d < 4; ++d) {
+            int r = x / C + DR[d], c = x % C + DC[d];
+            nb[x][d] = (r >= 0 && r < R && c >= 0 && c < C) ? r * C + c : -1;
         }
-
-        unsigned char *nl = st_lab[idx + 1], *nq = st_req[idx + 1], *ns = st_shp[idx + 1];
-        memcpy(nl, tl, dpC);
-        memcpy(nq, tq, dpC);
-        memcpy(ns, ts, dpC);
-        nl[c] = 0;
-        nq[c] = (unsigned char)south_req;
-        ns[c] = (unsigned char)top_class(t);
-
-        int next_left = 0, next_closed = closed;
-        int nin = (n_on ? 1 : 0) + (w_on ? 1 : 0);
-        if (t != T_DOT) {
-            if (nin == 0) {
-                int mx = ll;
-                for (int k = 0; k < dpC; ++k) if (tl[k] > mx) mx = tl[k];
-                if (e_on) next_left = mx + 1;
-                if (s_on) nl[c] = (unsigned char)(mx + 1);
-            } else if (nin == 1) {
-                int lab = n_on ? nlab : wlab;
-                if (e_on) next_left = lab;
-                if (s_on) nl[c] = (unsigned char)lab;
-            } else if (nlab == wlab) {
-                int open = 0;
-                for (int k = 0; k < dpC && !open; ++k) open = nl[k] != 0;
-                if (open || rem_pearl[idx + 1]) continue;
-                next_closed = 1;
-            } else {
-                for (int k = 0; k < dpC; ++k) if (nl[k] == wlab) nl[k] = (unsigned char)nlab;
+    for (int x = 0; x < NCELL; ++x)
+        for (int d = 1; d <= 2; ++d)   /* E and S edges own the id */
+            if (nb[x][d] >= 0) {
+                eu[NE] = x;
+                ev[NE] = nb[x][d];
+                ce[x][d] = NE;
+                ce[nb[x][d]][d ^ 2] = NE;   /* E<->W is 1<->3, S<->N is 2<->0 */
+                NE++;
             }
-        }
-
-        int nlq, nls;
-        if (c == dpC - 1) {
-            if (next_left || east_req != RQ_ALL) continue;
-            nlq = RQ_ALL;
-            nls = 0;
-        } else {
-            nlq = east_req;
-            nls = left_class(t);
-        }
-
-        /* Renumber labels in order of appearance so equal frontiers hash equal. */
-        unsigned char map[64] = {0};
-        int nxt = 1;
-        for (int k = 0; k < dpC; ++k) {
-            if (!nl[k]) continue;
-            if (!map[nl[k]]) map[nl[k]] = (unsigned char)nxt++;
-            nl[k] = map[nl[k]];
-        }
-        if (next_left) {
-            if (!map[next_left]) map[next_left] = (unsigned char)nxt++;
-            next_left = map[next_left];
-        }
-
-        st_ll[idx + 1] = (unsigned char)next_left;
-        st_lq[idx + 1] = (unsigned char)nlq;
-        st_ls[idx + 1] = (unsigned char)nls;
-        st_cl[idx + 1] = (unsigned char)next_closed;
-        dp_tile[idx] = (unsigned char)t;
-        if (dp_search(idx + 1)) return 1;
-        if (dp_abort) return 0;
-    }
-
-    memo_add(key);
-    return 0;
-}
-
-/*
- * Search the h x w sub-rectangle at (r0, c0), transposed when trans, until
- * deadline.  Cells outside it stay empty.  Keeps the loop if valid.
- */
-static int dp_run(int trans, int r0, int c0, int h, int w, double deadline, int dot_first) {
-    if (elapsed() >= deadline || h < 2 || w < 2) return 0;
-    if (!memo) {
-        memo = calloc(MEMO_CAP, sizeof(uint64_t));
-        memo_slots = malloc(MEMO_LIMIT * sizeof(uint32_t));
-        if (!memo || !memo_slots) return 0;
-    }
-    for (size_t i = 0; i < memo_count; ++i) memo[memo_slots[i]] = 0;
-    memo_count = 0;
-
-    dpR = trans ? w : h;
-    dpC = trans ? h : w;
-    dpTot = dpR * dpC;
-    for (int r = 0; r < dpR; ++r)
-        for (int c = 0; c < dpC; ++c)
-            dpG[r][c] = trans ? G[r0 + c][c0 + r] : G[r0 + r][c0 + c];
-    rem_pearl[dpTot] = 0;
-    for (int idx = dpTot - 1; idx >= 0; --idx)
-        rem_pearl[idx] = rem_pearl[idx + 1] || dpG[idx / dpC][idx % dpC] != '.';
-
-    memset(st_lab[0], 0, dpC);
-    memset(st_req[0], RQ_ALL, dpC);
-    memset(st_shp[0], 0, dpC);
-    st_ll[0] = 0;
-    st_lq[0] = RQ_ALL;
-    st_ls[0] = 0;
-    st_cl[0] = 0;
-
-    dp_abort = 0;
-    dp_calls = 0;
-    dp_deadline = deadline;
-    dp_dot_first = dot_first;
-    if (!dp_search(0)) return 0;
-
-    static Grid m;
-    memset(m, 0, sizeof(Grid));
-    for (int idx = 0; idx < dpTot; ++idx) {
-        int r = idx / dpC, c = idx % dpC, mask = TILE_MASK[dp_tile[idx]];
-        if (trans) {
-            int t = 0;
-            if (mask & NB) t |= WB;
-            if (mask & WB) t |= NB;
-            if (mask & SB) t |= EB;
-            if (mask & EB) t |= SB;
-            m[r0 + c][c0 + r] = (unsigned char)t;
-        } else {
-            m[r0 + r][c0 + c] = (unsigned char)mask;
+    EOFF = NE;
+    for (int x = 0; x < NCELL; ++x)
+        for (int d = 0; d < 4; ++d)
+            if (nb[x][d] < 0) ce[x][d] = EOFF;
+    for (int x = 0; x < NCELL; ++x) {
+        near_cnt[x] = 0;
+        for (int i = 0; i < npearl; ++i) {
+            int p = pearl_list[i];
+            if (abs(p / C - x / C) <= 2 && abs(p % C - x % C) <= 2)
+                near_list[x][near_cnt[x]++] = p;
         }
     }
-    return consider(m);
-}
 
-static int dp_full(int trans, double deadline, int dot_first) {
-    return dp_run(trans, 0, 0, R, C, deadline, dot_first);
-}
-
-/*
- * Frontier search on crops around the pearls, smallest area first: a small
- * crop keeps the frontier narrow and forces a short loop.  Crops grow the
- * pearl box by up to 4 per side, then by symmetric pads out to the full grid.
- */
-static void subrect_search(double deadline, double per_rect) {
-    static Rect rects[700];
-    int n = 0;
-    for (int et = 0; et <= 4 && et <= minr; ++et)
-        for (int eb = 0; eb <= 4 && maxr + eb < R; ++eb)
-            for (int el = 0; el <= 4 && el <= minc; ++el)
-                for (int er = 0; er <= 4 && maxc + er < C; ++er) {
-                    Rect x = {(short)(minr - et), (short)(minc - el), (short)(maxr + eb), (short)(maxc + er), 0};
-                    x.area = (x.b - x.t + 1) * (x.r - x.l + 1);
-                    if (x.b > x.t && x.r > x.l) rects[n++] = x;
-                }
-    for (int p = 5; n < 700; ++p) {
-        Rect x;
-        x.t = (short)(minr - p < 0 ? 0 : minr - p);
-        x.l = (short)(minc - p < 0 ? 0 : minc - p);
-        x.b = (short)(maxr + p >= R ? R - 1 : maxr + p);
-        x.r = (short)(maxc + p >= C ? C - 1 : maxc + p);
-        x.area = (x.b - x.t + 1) * (x.r - x.l + 1);
-        if (x.b > x.t && x.r > x.l) rects[n++] = x;
-        if (x.t == 0 && x.l == 0 && x.b == R - 1 && x.r == C - 1) break;
+    for (int e = 0; e < NE; ++e) st[e] = UNK;
+    st[EOFF] = OFF;
+    for (int x = 0; x < NCELL; ++x) {
+        don[x] = 0;
+        dunk[x] = 0;
+        for (int d = 0; d < 4; ++d) dunk[x] += nb[x][d] >= 0;
+        mate[x] = x;
+        plen[x] = 0;
+        inq[x] = 0;
     }
-    qsort(rects, n, sizeof(Rect), cmp_rect);
+    total_on = touched = nends = closed_ = 0;
+    tp = 0;
+    qh = qt = 0;
+}
 
-    for (int i = 0; i < n; ++i) {
-        double now = elapsed();
-        if (now >= deadline) break;
-        double d = now + per_rect < deadline ? now + per_rect : deadline;
-        int h = rects[i].b - rects[i].t + 1, w = rects[i].r - rects[i].l + 1;
-        dp_run(w > h, rects[i].t, rects[i].l, h, w, d, 1);
+static char tile_of(int x) {
+    int m = 0;
+    for (int d = 0; d < 4; ++d)
+        if (ce[x][d] != EOFF && best_st[ce[x][d]]) m |= 1 << d;
+    switch (m) {
+    case 1 | 4: return '|';
+    case 2 | 8: return '-';
+    case 1 | 2: return 'L';
+    case 1 | 8: return 'J';
+    case 4 | 2: return 'F';
+    case 4 | 8: return '7';
     }
-}
-
-/* ---------- annealing on a rectangle cycle cover ---------- */
-
-static Grid hm;
-static int clab[MAXN][MAXN];
-
-static int window_cost(int r, int c) {
-    int s = 0;
-    for (int rr = r - 1; rr <= r + 2; ++rr)
-        for (int cc = c - 1; cc <= c + 2; ++cc)
-            if (rr >= 0 && rr < R && cc >= 0 && cc < C && G[rr][cc] != '.')
-                s += pearl_cost(hm, rr, cc);
-    return s;
-}
-
-/* Swap two parallel edges across the 2x2 square at (r, c) for the other pair. */
-static int try_flip(int r, int c) {
-    int a = hm[r][c], b = hm[r][c + 1], d = hm[r + 1][c], e = hm[r + 1][c + 1];
-    int horizontal = (a & EB) && (b & WB) && (d & EB) && (e & WB) &&
-                     !(a & SB) && !(b & SB) && !(d & NB) && !(e & NB);
-    int vertical = (a & SB) && (d & NB) && (b & SB) && (e & NB) &&
-                   !(a & EB) && !(d & EB) && !(b & WB) && !(e & WB);
-    if (!horizontal && !vertical) return 0;
-    hm[r][c] ^= EB | SB;
-    hm[r][c + 1] ^= WB | SB;
-    hm[r + 1][c] ^= EB | NB;
-    hm[r + 1][c + 1] ^= WB | NB;
-    return 1;
-}
-
-static int label_components(void) {
-    static int stk[MAXN * MAXN];
-    int count = 0;
-    memset(clab, 0, sizeof(clab));
-    for (int r = 0; r < R; ++r)
-        for (int c = 0; c < C; ++c) {
-            if (!hm[r][c] || clab[r][c]) continue;
-            int sp = 0;
-            clab[r][c] = ++count;
-            stk[sp++] = r * MAXN + c;
-            while (sp) {
-                int cur = stk[--sp], rr = cur / MAXN, cc = cur % MAXN;
-                for (int k = 0; k < 4; ++k) {
-                    if (!(hm[rr][cc] & DBIT[k])) continue;
-                    int nr = rr + DRow[k], nc = cc + DCol[k];
-                    if (!clab[nr][nc]) {
-                        clab[nr][nc] = count;
-                        stk[sp++] = nr * MAXN + nc;
-                    }
-                }
-            }
-        }
-    return count;
-}
-
-static int merge_cycles(int r0, int r1, int c0, int c1, double deadline) {
-    static int sq[MAXN * MAXN];
-    int nsq = 0;
-    for (int r = r0; r < r1; ++r)
-        for (int c = c0; c < c1; ++c) sq[nsq++] = r * MAXN + c;
-
-    while (elapsed() < deadline) {
-        if (label_components() <= 1) return 1;
-        for (int i = nsq - 1; i > 0; --i) {
-            int j = (int)(rng() % (uint64_t)(i + 1)), t = sq[i];
-            sq[i] = sq[j];
-            sq[j] = t;
-        }
-        int changed = 0;
-        for (int i = 0; i < nsq && !changed; ++i) {
-            int r = sq[i] / MAXN, c = sq[i] % MAXN;
-            int a = hm[r][c], b = hm[r][c + 1], d = hm[r + 1][c], e = hm[r + 1][c + 1];
-            int horizontal = (a & EB) && (b & WB) && (d & EB) && (e & WB) &&
-                             clab[r][c] != clab[r + 1][c];
-            int vertical = (a & SB) && (d & NB) && (b & SB) && (e & NB) &&
-                           clab[r][c] != clab[r][c + 1];
-            if (!horizontal && !vertical) continue;
-            int before = window_cost(r, c);
-            if (!try_flip(r, c)) continue;
-            if (before == 0 && window_cost(r, c) == 0) changed = 1;
-            else try_flip(r, c);
-        }
-        if (!changed) return 0;
-    }
-    return 0;
-}
-
-static int heuristic(double deadline) {
-    if (elapsed() >= deadline) return 0;
-
-    int r0 = minr, r1 = maxr, c0 = minc, c1 = maxc;
-    if (r0 == r1) { if (r0 > 0) r0--; else r1++; }
-    if (c0 == c1) { if (c0 > 0) c0--; else c1++; }
-
-    /* Smallest rectangle around the pearls with a Hamiltonian cycle (an even side). */
-    int bt = -1, bl = 0, bb = 0, br = 0, barea = INT_MAX;
-    for (int t = 0; t <= r0; ++t)
-        for (int b = r1; b < R; ++b)
-            for (int l = 0; l <= c0; ++l)
-                for (int rt = c1; rt < C; ++rt) {
-                    int h = b - t + 1, w = rt - l + 1;
-                    if ((h & 1) && (w & 1)) continue;
-                    if (h * w < barea) { barea = h * w; bt = t; bb = b; bl = l; br = rt; }
-                }
-    if (bt < 0 || barea >= best_len) return 0;  /* result length is the area */
-    r0 = bt; r1 = bb; c0 = bl; c1 = br;
-    build_snake(hm, r0, c0, r1 - r0 + 1, c1 - c0 + 1, ((r1 - r0 + 1) & 1) ? 1 : 0);
-
-    int cost = 0;
-    for (int i = 0; i < npearl; ++i) cost += pearl_cost(hm, pearl_r[i], pearl_c[i]);
-    if (cost == 0 && consider(hm)) return 1;
-
-    rng_state ^= (uint64_t)(R * 131 + C) * 0x9E3779B97F4A7C15ULL;
-    const long period = 1500000;
-    long it = 0, phase = 0, last_merge = -1000000;
-    while (1) {
-        if ((it & 255) == 0 && elapsed() > deadline) break;
-        it++;
-        phase++;
-        if (cost == 0 && it - last_merge > 2000) {
-            last_merge = it;
-            double md = elapsed() + 0.25;
-            if (md > deadline) md = deadline;
-            if (merge_cycles(r0, r1, c0, c1, md) && consider(hm)) return 1;
-        }
-
-        int r = r0 + (int)(rng() % (uint64_t)(r1 - r0));
-        int c = c0 + (int)(rng() % (uint64_t)(c1 - c0));
-        int before = window_cost(r, c);
-        unsigned char sa = hm[r][c], sb = hm[r][c + 1], sd = hm[r + 1][c], se = hm[r + 1][c + 1];
-        if (!try_flip(r, c)) continue;
-        int delta = window_cost(r, c) - before;
-        double temp = 2.5 * (1.0 - (double)phase / period);
-        if (temp < 0.05) temp = 0.05;
-        if (delta <= 0 || rng01() < exp(-delta / temp)) {
-            cost += delta;
-        } else {
-            hm[r][c] = sa; hm[r][c + 1] = sb; hm[r + 1][c] = sd; hm[r + 1][c + 1] = se;
-        }
-        if (phase >= 2 * period && cost > 0) phase = 0;  /* reheat when stuck */
-    }
-    return 0;
-}
-
-/* ---------- driver ---------- */
-
-static char tile_char(int m) {
-    if (m == (WB | EB)) return '-';
-    if (m == (NB | SB)) return '|';
-    if (m == (NB | EB)) return 'L';
-    if (m == (NB | WB)) return 'J';
-    if (m == (SB | EB)) return 'F';
-    if (m == (SB | WB)) return '7';
     return '.';
 }
 
@@ -738,72 +791,68 @@ char **solve(int grid_count, char **grid, int *result_count) {
     R = grid_count;
     C = 0;
     while (grid[0][C] == '.' || grid[0][C] == 'W' || grid[0][C] == 'B') C++;
+    build(grid);
 
-    npearl = 0;
-    minr = R; maxr = -1; minc = C; maxc = -1;
-    for (int r = 0; r < R; ++r)
-        for (int c = 0; c < C; ++c) {
-            char ch = grid[r][c];
-            G[r][c] = (ch == 'W' || ch == 'B') ? ch : '.';
-            if (G[r][c] == '.') continue;
-            pearl_r[npearl] = r;
-            pearl_c[npearl++] = c;
-            if (r < minr) minr = r;
-            if (r > maxr) maxr = r;
-            if (c < minc) minc = c;
-            if (c > maxc) maxc = c;
-        }
-    if (!npearl) { minr = maxr = minc = maxc = 0; }
-    best_len = INT_MAX;
+    have_best = 0;
+    best_len = 0;
+    nodes = 0;
 
-    int trans = C > R;              /* frontier runs along the narrower side */
-    int narrow = R < C ? R : C;
-
-    /* Inside the free first second every phase runs; the shortest loop wins. */
-    constructive(0.15);
-    subrect_search(0.6, 0.03);
-    dp_full(trans, 0.7, 1);
-    heuristic(0.85);
-    dp_full(!trans, 0.9, 1);
-
-    if (have_answer()) {
-        /* done */
-    } else if (narrow <= 8) {
-        if (!have_answer()) dp_full(trans, 7.0, 1);
-        if (!have_answer()) dp_full(trans, 8.0, 0);
-        if (!have_answer()) dp_full(!trans, 8.5, 1);
-        if (!have_answer()) dp_full(!trans, 8.8, 0);
-    } else {
-        if (!have_answer()) subrect_search(2.5, 0.3);
-        if (!have_answer()) heuristic(6.0);
-        if (!have_answer()) dp_full(trans, 7.5, 1);
-        if (!have_answer()) dp_full(trans, 8.0, 0);
-        if (!have_answer()) dp_full(!trans, 8.4, 1);
-        if (!have_answer()) dp_full(!trans, 8.8, 0);
-        if (!have_answer()) heuristic(8.8);
+    /* root deductions, kept for the annealer */
+    {
+        int mark = tp;
+        for (int x = 0; x < NCELL; ++x) push(x);
+        int ok = propagate() && probe();
+        for (int e = 0; e < NE; ++e) known[e] = ok ? st[e] : UNK;
+        undo(mark);
+        clear_queue();
     }
-
-    if (!have_answer()) {
-        /* No valid loop found: border loop (only kept if valid), else dots. */
-        static Grid m;
-        if (R >= 2 && C >= 2) {
-            build_perimeter(m, 0, 0, R - 1, C - 1);
-            consider(m);
-        }
-        if (!have_answer()) memset(best, 0, sizeof(Grid));
-    }
+    run_dfs(DFS_FIND, IMPROVE_UNTIL);
+    if (!have_best) anneal(HARD_LIMIT);
+    if (have_best && elapsed() < IMPROVE_UNTIL) run_dfs(IMPROVE_UNTIL, IMPROVE_UNTIL);
 
     char **ans = malloc(R * sizeof(char *));
     for (int r = 0; r < R; ++r) {
         ans[r] = malloc(C + 1);
-        for (int c = 0; c < C; ++c) ans[r][c] = tile_char(best[r][c]);
+        for (int c = 0; c < C; ++c) ans[r][c] = have_best ? tile_of(r * C + c) : '.';
         ans[r][C] = '\0';
     }
     *result_count = R;
     return ans;
 }
 
-#ifdef LOCAL
+#ifdef CHECKSOL
+/* Debug: read a puzzle followed by a known solution, impose the solution's
+ * edges one by one and report the first step the rules reject. */
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) return 1;
+    static char g[MAXN][128], s[MAXN][128];
+    char *rows[MAXN];
+    for (int i = 0; i < n; ++i) { if (scanf("%127s", g[i]) != 1) return 1; rows[i] = g[i]; }
+    for (int i = 0; i < n; ++i) if (scanf("%127s", s[i]) != 1) return 1;
+    t_start = wall_now();
+    R = n;
+    C = strlen(g[0]);
+    build(rows);
+    for (int x = 0; x < NCELL; ++x) push(x);
+    if (!propagate()) { printf("root contradiction\n"); return 0; }
+    for (int e = 0; e < NE; ++e) {
+        int a = eu[e], b = ev[e], d = b == a + 1 ? 1 : 2;
+        char t = s[a / C][a % C];
+        int has = (d == 1) ? (t == '-' || t == 'L' || t == 'F') : (t == '|' || t == 'F' || t == '7');
+        if (!set_edge(e, has ? ON : OFF) || !propagate() || (!closed_ && !connected())) {
+            printf("contradiction at edge %d (%d,%d)-(%d,%d) want %s\n", e,
+                   a / C, a % C, b / C, b % C, has ? "ON" : "OFF");
+            return 0;
+        }
+    }
+    printf("ok closed=%d len=%d\n", closed_, total_on);
+    return 0;
+}
+#elif defined(LOCAL)
+#ifdef STATS
+int stat_known, stat_root_on, stat_max_touched, stat_max_on;
+#endif
 int main(void) {
     int grid_count;
     if (scanf("%d", &grid_count) != 1) return 0;
@@ -817,7 +866,12 @@ int main(void) {
     int result_count = 0;
     char **result = solve(grid_count, grid, &result_count);
     for (int i = 0; i < result_count; ++i) printf("%s\n", result[i]);
-    fprintf(stderr, "time %.3f len %d\n", elapsed(), have_answer() ? best_len : -1);
+    fprintf(stderr, "time %.3f len %d nodes %lld\n", elapsed(), have_best ? best_len : -1, nodes);
+#ifdef STATS
+    fprintf(stderr, "edges %d root_known %d root_on %d pearls %d max_touched %d max_on %d\n",
+            NE, stat_known, stat_root_on, npearl, stat_max_touched, stat_max_on);
+    fprintf(stderr, "sa_min_cost %d\n", sa_min_cost);
+#endif
     return 0;
 }
 #endif
